@@ -1,9 +1,22 @@
 import argparse
+import fnmatch
 import logging
 import os
 import stat
 import sys
+from pathlib import Path
 from typing import List, Tuple
+
+
+def parse_octal(value: str) -> int:
+    """Parses an octal permission value such as 777, 0777, or 0o777."""
+    try:
+        result = int(str(value).strip(), 8)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid octal value: {value!r} (use a form such as 755, 0755, or 0o755)")
+    if result < 0 or result > 0o7777:
+        raise argparse.ArgumentTypeError(f"octal permission value out of range: {value!r}")
+    return result
 
 try:
     import pathspec
@@ -39,18 +52,10 @@ def setup_argparse() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--privileged-users",
-        type=str,
-        nargs='+',
-        default=["root", "admin"],
-        help="List of privileged users to check for default passwords (placeholder). Defaults to ['root', 'admin'].",
-    )
-
-    parser.add_argument(
         "--min-permissions",
-        type=oct,
+        type=parse_octal,
         default=0o777,  # Default overly permissive mode. Change as needed
-        help="Minimum permission value considered overly permissive (octal). Defaults to 0777.",
+        help="Minimum permission value considered overly permissive (octal, for example 755, 0755, or 0o755). Defaults to 0777.",
     )
 
     parser.add_argument(
@@ -77,44 +82,52 @@ def setup_argparse() -> argparse.ArgumentParser:
     return parser
 
 
-def check_permissions(path: str, wildcard_patterns: List[str], min_permissions: int, exclude_paths: List[str]) -> List[Tuple[str, int]]:
+def check_permissions(path: str, wildcard_patterns: List[str], min_permissions: int, exclude_paths: List[str]) -> Tuple[List[Tuple[str, int]], int]:
     """
-    Checks file permissions recursively under the given path.
+    Checks permissions recursively under the given path, for files and
+    for subdirectories. The scanned root itself is not counted as an entry.
 
     Args:
         path: The path to start the check from.
-        wildcard_patterns: A list of wildcard patterns to match files against.
+        wildcard_patterns: A list of glob patterns matched against each
+            entry name and full path with fnmatch.
         min_permissions: The minimum permission value considered overly permissive.
         exclude_paths: A list of paths to exclude from the check.
 
     Returns:
-        A list of tuples, where each tuple contains the file path and its permissions (in octal) for overly permissive files.
+        A pair: the list of (path, permissions) tuples for overly
+        permissive entries, and the number of entries actually checked.
     """
     logging.info(f"Checking permissions under path: {path}")
 
     overly_permissive_files = []
+    checked = 0
     spec = pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, exclude_paths)
 
-    for root, _, files in os.walk(path):
-        for file in files:
-            file_path = os.path.join(root, file)
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            entry_path = os.path.join(root, name)
 
-            if spec.match_file(file_path):
-                logging.debug(f"Excluding path: {file_path}")
+            if spec.match_file(entry_path):
+                logging.debug(f"Excluding path: {entry_path}")
                 continue
 
-            for pattern in wildcard_patterns:
-                if file_path.endswith(pattern) or pattern == "*":  # Efficient wildcard matching
+            if not any(
+                fnmatch.fnmatch(entry_path, pattern) or fnmatch.fnmatch(name, pattern)
+                for pattern in wildcard_patterns
+            ):
+                continue
 
-                    try:
-                        permissions = stat.S_IMODE(os.stat(file_path).st_mode)
-                        if permissions >= min_permissions:
-                            overly_permissive_files.append((file_path, permissions))
-                            logging.warning(f"Found overly permissive file: {file_path} with permissions {oct(permissions)}")
-                    except OSError as e:
-                        logging.error(f"Error checking permissions for {file_path}: {e}")
+            checked += 1
+            try:
+                permissions = stat.S_IMODE(os.stat(entry_path).st_mode)
+                if permissions >= min_permissions:
+                    overly_permissive_files.append((entry_path, permissions))
+                    logging.warning(f"Found overly permissive entry: {entry_path} with permissions {oct(permissions)}")
+            except OSError as e:
+                logging.error(f"Error checking permissions for {entry_path}: {e}")
 
-    return overly_permissive_files
+    return overly_permissive_files, checked
 
 
 def check_offensive_tools(path: str) -> List[str]:
@@ -149,7 +162,8 @@ def generate_report(overly_permissive_files: List[Tuple[str, int]], offensive_to
         offensive_tools: A list of paths where offensive tools were found.
         output_file: The path to save the report to. If None, prints to the console.
     """
-    console = Console(file=open(output_file, "w") if output_file else sys.stdout)
+    report_handle = open(output_file, "w") if output_file else None
+    console = Console(file=report_handle if report_handle else sys.stdout)
 
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("File Path", style="dim", width=60)
@@ -171,6 +185,9 @@ def generate_report(overly_permissive_files: List[Tuple[str, int]], offensive_to
     else:
         console.print("\n[green]No offensive tools found.[/]")
 
+    if report_handle:
+        report_handle.close()
+
     if output_file:
         print(f"Report saved to {output_file}")
 
@@ -191,10 +208,23 @@ def main() -> None:
         print(f"Error: Min permissions '{args.min_permissions}' is not a valid octal integer")
         sys.exit(1)
 
+    # The report file may not overwrite a file inside the scanned tree.
+    if args.report_file:
+        scan_root = Path(args.path).resolve()
+        report_path = Path(args.report_file).resolve()
+        if report_path == scan_root or scan_root in report_path.parents:
+            print(f"Error: Report file '{args.report_file}' is inside the scanned path '{args.path}'; refusing to overwrite a scanned file.")
+            sys.exit(1)
+
     try:
-        overly_permissive_files = check_permissions(args.path, args.wildcard_patterns, args.min_permissions, args.exclude_paths)
+        overly_permissive_files, checked_count = check_permissions(args.path, args.wildcard_patterns, args.min_permissions, args.exclude_paths)
     except Exception as e:
         logging.error(f"An error occurred during permission checking: {e}")
+        sys.exit(1)
+
+    if checked_count == 0:
+        print(f"Error: Nothing was checked under '{args.path}' with the given patterns; no clean result is reported.")
+        logging.error("Zero entries were checked; exiting non-zero instead of reporting a clean scan.")
         sys.exit(1)
 
     offensive_tools = []
