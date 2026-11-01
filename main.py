@@ -102,6 +102,7 @@ def check_permissions(path: str, wildcard_patterns: List[str], min_permissions: 
 
     overly_permissive_files = []
     checked = 0
+    # The operator hands me plain paths here, but I feed them to a gitignore style matcher and test each entry's full path against it. An exclude written for a different root, or with a trailing shape the pattern engine reads differently, silently excludes nothing, and excluded directories are never pruned from the walk either, so I still stat everything beneath them.
     spec = pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, exclude_paths)
 
     for root, dirs, files in os.walk(path):
@@ -121,6 +122,7 @@ def check_permissions(path: str, wildcard_patterns: List[str], min_permissions: 
             checked += 1
             try:
                 permissions = stat.S_IMODE(os.stat(entry_path).st_mode)
+                # I compare the mode as a single number, not bit by bit per class. A file that is wide open to everyone but closed to its owner can sit below a 755 threshold numerically and pass, while a setuid file crosses almost any threshold on its extra high bits alone. The number ordering is a blunt stand in for per class judgement.
                 if permissions >= min_permissions:
                     overly_permissive_files.append((entry_path, permissions))
                     logging.warning(f"Found overly permissive entry: {entry_path} with permissions {oct(permissions)}")
@@ -145,6 +147,7 @@ def check_offensive_tools(path: str) -> List[str]:
 
     for root, _, files in os.walk(path):
         for file in files:
+            # This is an exact whole filename test with the case folded. A renamed binary slips past, a Windows copy carrying its .exe suffix slips past, and an innocent text file that happens to share one of these names is reported as a possible tool.
             if file.lower() in offensive_tool_names:
                 file_path = os.path.join(root, file)
                 found_tools.append(file_path)
@@ -230,6 +233,7 @@ def main() -> None:
     offensive_tools = []
     if args.include_offensive_tools:
         try:
+            # This second walk ignores the wildcard patterns and the exclude list from the first one. A directory the operator explicitly excluded from the permission check is still searched for tool names, which surprises people who treated the exclude list as a boundary for the whole run.
             offensive_tools = check_offensive_tools(args.path)
         except Exception as e:
             logging.error(f"An error occurred during offensive tool checking: {e}")
